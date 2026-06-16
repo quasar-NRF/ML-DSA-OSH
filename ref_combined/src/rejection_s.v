@@ -89,7 +89,11 @@ module rejection_s #(
     reg [7:0] sipo_out_len, sipo_out_len_next;
     
     always @(*) begin
-        ready_i = (sipo_in_len < 3*RDI_SAMPLE_W) ? 1 : 0;
+        // Backpressure: also stop accepting Keccak output when our output
+        // buffer is near capacity and downstream is stalled, to prevent
+        // sipo_out_len (8-bit) from wrapping and permanently killing valid_o.
+        ready_i = (sipo_in_len < 3*RDI_SAMPLE_W) &&
+                  (sipo_out_len < 200 - 3*SAMPLE_W || valid_o && ready_o) ? 1 : 0;
         valid_o = (sipo_out_len >= SAMPLE_W*BUS_W) ? 1 : 0;
     
         rej_lane0 = SIPO_IN[3:0];

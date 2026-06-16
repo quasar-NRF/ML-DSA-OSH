@@ -94,6 +94,7 @@ module makehint #(
     reg [3:0] K;
     
     integer i, k;
+    // fix: debug instrumentation (MH, MHM) removed after T0 stall fix verified.
     always @(*) begin
         poly_ready_i = 1;
         reject_hint  = 0;

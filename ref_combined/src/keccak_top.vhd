@@ -41,6 +41,12 @@ architecture structure of keccak_top is
     signal output_size               : std_logic_vector(10 downto 0);
 begin
 
+	-- mode is driven by keccak_datapath output (from din[62:61] of each
+	-- control word). Do NOT add a second driver here — that creates a
+	-- resolution conflict that corrupts padding for modules that use
+	-- different modes (GenA uses din[62:61]="00" for SHAKE128 capacity;
+	-- GenY/GenC/etc. use din[62:61]="11" for SHAKE256).
+
 	control_gen : entity work.keccak_control(struct)
 		port map (
             clk           => clk,

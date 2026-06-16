@@ -72,7 +72,9 @@ module expandmask_ext #(
     output reg   src_ready,
     input        src_read,
     input        dst_write,
-    output reg   dst_ready
+    output reg   dst_ready,
+    output [3:0] cstate_o,
+    output [31:0] ctr_o
     );
     
     localparam
@@ -90,8 +92,9 @@ module expandmask_ext #(
         S_WAIT          = 4'd11;
     
     reg [3:0] cstate, nstate;
+    assign cstate_o = cstate;
+    assign ctr_o    = ctr;
     reg [31:0] ctr, ctr_next;
-    
     reg  rst_y;
     reg  [31:0] ctrl_len;
 
@@ -242,82 +245,80 @@ module expandmask_ext #(
     end
         
     always @(posedge clk) begin
-        if (rst) begin
-            cstate <= S_HOLD;
-            rst_y  <= 1;
-        end else begin
-            rst_y <= 0;
-            cstate <= nstate;
-        end
-    end
-    
-    
-    always @(posedge clk) begin
         done_sampler <= 0;
-        start_y <= 0;
-    
-        mu_valid <= 0;
-    
-        case(cstate)
-        S_HOLD: begin
-            NONCE  <= 0;
-            OFFSET <= 0;
+        start_y      <= 0;
+        mu_valid     <= 0;
 
-            SIPO_status <= 0;
-        end
-        S_ABSORB_TR: begin
-            ctr <= (ctr_next == 8) ? 0 : ctr_next;
-        end
-        S_ABSORB_M: begin
-            ctr <= ({ctr_next, 3'd0} >= msg_bytes) ? 0 : ctr_next;
-        end
-        S_HASH_MU: begin
-            mu_valid <= dst_write;
-            mu_out   <= dout;
-            if (dst_write) begin
-                SIPO_status <= {SIPO_status[6:0],1'b1};
-                SEED_SIPO   <= {SEED_SIPO[447:0], dout};
-            end
-        end
-        S_ABSORB_K: begin // K +rnd
-            ctr <= (ctr_next == 8) ? 0 : ctr_next;
-        end
-        S_ABSORB_MU: begin
-            if (src_read) begin
-                SIPO_status <= {1'b0, SIPO_status[7:1]};
-                SEED_SIPO   <= {SEED_SIPO[447:0], 64'd0};
-            end
-        end
-        S_HASH_RHO_P: begin
-            if (dst_write) begin
-                SIPO_status <= {SIPO_status[6:0],1'b1};
-                SEED_SIPO   <= {SEED_SIPO[447:0], dout};
-            end
-            
-            
-            start_y <= (dst_write && SIPO_status[6]) ? 1 : 0;
-        end
-        S_LOAD_SAMPLERS: begin
-            if (&ready_i) begin
-                SEED_SIPO     <= {SEED_SIPO[447:0], SEED_SIPO[511:448]};
-                ctr           <= (ctr == 7) ? 0 : ctr_next;
-            end
-        end
-        S_RUN_SAMPLERS: begin
-            start_y <= (done && NONCE < L-1) ? 1 : 0; 
-        
-            if (done && NONCE == L-1) begin
-                done_sampler <= 1;
-                OFFSET <= OFFSET+L;
+        if (rst) begin
+            cstate       <= S_HOLD;
+            rst_y        <= 1;
+            ctr          <= 0;
+            NONCE        <= 0;
+            OFFSET       <= 0;
+            SIPO_status  <= 0;
+            SEED_SIPO    <= 0;
+        end else begin
+            rst_y  <= 0;
+            cstate <= nstate;
+
+            case(cstate)
+            S_HOLD: begin
                 NONCE  <= 0;
-            end else if (done) begin
-                NONCE <= NONCE + 1; 
+                OFFSET <= 0;
+                SIPO_status <= 0;
+                SEED_SIPO   <= 0;
             end
+            S_ABSORB_TR: begin
+                ctr <= (ctr_next == 8) ? 0 : ctr_next;
+            end
+            S_ABSORB_M: begin
+                ctr <= ({ctr_next, 3'd0} >= msg_bytes) ? 0 : ctr_next;
+            end
+            S_HASH_MU: begin
+                mu_valid <= dst_write;
+                mu_out   <= dout;
+                if (dst_write) begin
+                    SIPO_status <= {SIPO_status[6:0],1'b1};
+                    SEED_SIPO   <= {SEED_SIPO[447:0], dout};
+                end
+            end
+            S_ABSORB_K: begin
+                ctr <= (ctr_next == 8) ? 0 : ctr_next;
+            end
+            S_ABSORB_MU: begin
+                if (src_read) begin
+                    SIPO_status <= {1'b0, SIPO_status[7:1]};
+                    SEED_SIPO   <= {SEED_SIPO[447:0], 64'd0};
+                end
+            end
+            S_HASH_RHO_P: begin
+                if (dst_write) begin
+                    SIPO_status <= {SIPO_status[6:0],1'b1};
+                    SEED_SIPO   <= {SEED_SIPO[447:0], dout};
+                end
+                start_y <= (dst_write && SIPO_status[6]) ? 1 : 0;
+            end
+            S_LOAD_SAMPLERS: begin
+                if (&ready_i) begin
+                    SEED_SIPO <= {SEED_SIPO[447:0], SEED_SIPO[511:448]};
+                    ctr       <= (ctr == 7) ? 0 : ctr_next;
+                end
+            end
+            S_RUN_SAMPLERS: begin
+                start_y <= (done && NONCE < L-1) ? 1 : 0;
+                if (done && NONCE == L-1) begin
+                    done_sampler <= 1;
+                    OFFSET <= OFFSET+L;
+                    NONCE  <= 0;
+                end else if (done) begin
+                    NONCE <= NONCE + 1;
+                end
+            end
+            S_WAIT: begin
+                start_y <= (start) ? 1 : 0;
+            end
+            endcase
         end
-        S_WAIT: begin
-            start_y <= (start) ? 1 : 0;
-        end
-        endcase
     end     
     
 endmodule

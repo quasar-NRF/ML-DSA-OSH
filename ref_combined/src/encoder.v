@@ -47,7 +47,7 @@
 `timescale 1ns / 1ps
 
 
-module encoder #(
+module mldsa_encoder #(
     parameter OUTPUT_W    = 4,
     parameter COEFF_W     = 23,
     parameter MAX_LVL     = 20,
@@ -87,8 +87,9 @@ module encoder #(
     wire [OUTPUT_W*COEFF_W-1:0] di_uncentered;
     reg  [OUTPUT_W*COEFF_W-1:0] di_uncentered_buffer;
     wire [MAX_LVL*OUTPUT_W-1:0]  stripped;
-    
+
     reg [OUTPUT_W*COEFF_W-1:0] di_buffer;
+    reg [4:0] ENCODE_LVL_pipe;
 
     reg [1:0] valid_buffer;
 
@@ -99,11 +100,17 @@ module encoder #(
         end
     endgenerate
 
-    zero_strip Z_STRIP(ENCODE_LVL, di_uncentered_buffer, stripped);
-    
+    zero_strip Z_STRIP(ENCODE_LVL_pipe, di_uncentered_buffer, stripped);
+
+    // PISO width matches the original design (256 bits). The earlier 512-bit
+    // PISO was a failed overflow hypothesis — the actual bug was in the FSM
+    // (FSM0_UNLOAD_Z addra_ram6 not accounting for RAM read latency during
+    // stall), now fixed in combined_top.v. With the FSM fix, the bridge
+    // no longer induces duplicate accepts, so PISO accumulation matches the
+    // standalone (no-stall) case and 256 bits is sufficient.
     reg [255:0] PISO;
-    reg [9:0]  piso_len, piso_len_next;
-    reg [9:0] buffer_len [1:0];
+    reg [8:0]  piso_len, piso_len_next;
+    reg [8:0] buffer_len [1:0];
     
     initial begin
         PISO = 0;
@@ -155,15 +162,24 @@ module encoder #(
         endcase
     
         
-        valid_o = (piso_len >= W) ? 1 : 0; 
-        piso_len_next = (valid_o && ready_o) ? piso_len - W: piso_len;   
+        valid_o = (piso_len >= W) ? 1 : 0;
+        piso_len_next = (valid_o && ready_o) ? piso_len - W: piso_len;
+        // ready_i=1 always (original behavior). The FSM addra_ram6 stall fix
+        // in combined_top.v ensures the FSM doesn't feed the encoder during
+        // output stall, so PISO can't overflow under bridge backpressure.
         ready_i = 1;
         
         dout = PISO[W-1:0];
     end
     
     always @(posedge clk) begin
-        
+
+        if (rst) begin
+            ENCODE_LVL_pipe <= 0;
+        end else if (ready_i && valid_i) begin
+            ENCODE_LVL_pipe <= ENCODE_LVL;
+        end
+
         di_uncentered_buffer <= di_uncentered;
 
         valid_buffer[0] <= ready_i && valid_i;
@@ -182,7 +198,7 @@ module encoder #(
                 if (valid_o && ready_o) begin
                     PISO <= (PISO >> W) | ({192'd0, stripped} << piso_len_next);
                 end else begin
-                    PISO <= PISO | ({192'd0, stripped} << piso_len_next);    
+                    PISO <= PISO | ({192'd0, stripped} << piso_len_next);
                 end
             end else if (valid_o && ready_o) begin
                 PISO <= (PISO >> W);

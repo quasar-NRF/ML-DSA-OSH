@@ -64,7 +64,9 @@ module usehint #(
         output reg poly_ready_i,
         output reg [OUTPUT_W*COEFF_W-1:0] poly_o,
         output reg poly_valid_o,
-        input      poly_ready_o
+        input      poly_ready_o,
+        output [256*8-1:0] hint_poly_out,
+        output [10:0] ctr_out
     );
     
     reg [7:0]   hint_cnt [7:0];
@@ -77,6 +79,8 @@ module usehint #(
     reg [95:0] tmp;
     
     reg [256*8-1:0] hint_poly;
+    assign hint_poly_out = hint_poly;
+    assign ctr_out = ctr;
     
     localparam
         LVL2_LEN = 7'd80,

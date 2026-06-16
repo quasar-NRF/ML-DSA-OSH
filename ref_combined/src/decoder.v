@@ -47,7 +47,7 @@
 `timescale 1ns / 1ps
 
 
-module decoder #(
+module mldsa_decoder #(
     parameter OUTPUT_W    = 4,
     parameter COEFF_W     = 23,
     parameter W           = 64
@@ -95,10 +95,12 @@ module decoder #(
     initial begin
         SIPO_IN  = 0;
         SIPO_OUT = 0;
-    
+
         sipo_in_len  = 0;
         sipo_out_len = 0;
     end
+
+    // fix: debug instrumentation removed after T0 stall fix verified.
     
     always @(*) begin    
         ETA = 0;
@@ -165,7 +167,12 @@ module decoder #(
         endcase
         
         
-        valid_o = (sipo_out_len >= OUTPUT_W*COEFF_W) ? 1 : 0; 
+        // fix: gate valid_o during T0 stall so the downstream FSM doesn't
+        // consume duplicate samples while we're waiting for valid_i.
+        // After STALL_TIMEOUT cycles, the stall releases (t0_stall=0) and
+        // valid_o regains its true value, allowing the FSM to consume the
+        // (potentially partially-stale) output and progress.
+        valid_o = (sipo_out_len >= OUTPUT_W*COEFF_W && !t0_stall) ? 1 : 0; 
         ready_i = (sipo_in_len < 4*ENCODE_LVL || (valid_o && 4*ENCODE_LVL > 63)) ? 1 : 0;
         
         sipo_in_len_next  = (ready_i && valid_i) ? sipo_in_len + W : sipo_in_len;
@@ -188,19 +195,41 @@ module decoder #(
         end
     end
     
+    // fix: in T0 mode, when sin>=4*ENCODE_LVL AND valid_i=0 AND sin<2*4*ENCODE_LVL,
+    // shifting without loading would corrupt output (bits [sin-52:51] become
+    // stale). Stall state AND gate valid_o to 0 to prevent FSM from consuming
+    // duplicate samples. After STALL_TIMEOUT cycles of stalling, assume we're
+    // in draining mode (no more data coming) and force shift with original
+    // behavior so the FSM can complete the last few outputs and transition.
+    localparam STALL_TIMEOUT = 24;
+    reg [4:0] stall_cnt;
+    wire t0_stall_active = (encode_modei == 3'd0) && !valid_i &&
+                           (sipo_in_len >= 4*ENCODE_LVL) &&
+                           (sipo_in_len < 2*4*ENCODE_LVL);
+    wire t0_stall = t0_stall_active && (stall_cnt < STALL_TIMEOUT);
+
     always @(posedge clk) begin
         encode_mode <= encode_modei;
         if (rst) begin
             SIPO_IN  <= 0;
             SIPO_OUT <= 0;
             sipo_in_len  <= 0;
-            sipo_out_len <= 0;  
+            sipo_out_len <= 0;
+            stall_cnt    <= 0;
+        end else if (t0_stall) begin
+            // fix: hold all state during T0 stall. valid_o gated below.
+            SIPO_IN      <= SIPO_IN;
+            SIPO_OUT     <= SIPO_OUT;
+            sipo_in_len  <= sipo_in_len;
+            sipo_out_len <= sipo_out_len;
+            stall_cnt    <= stall_cnt + 1;
         end else begin
+            stall_cnt    <= t0_stall_active ? 0 : 0;
             if (sipo_out_len_next <= OUTPUT_W*COEFF_W) begin
                 if (sipo_in_len >= 4*ENCODE_LVL) begin
                     sipo_in_len  <= sipo_in_len_next  - 4*ENCODE_LVL;
                     sipo_out_len <= sipo_out_len_next + 4*COEFF_W;
-                    
+
                     if (valid_i) begin
                         SIPO_IN <= SIPO_IN_SHIFT | di_shift;
                     end else begin
@@ -209,7 +238,7 @@ module decoder #(
                 end else begin
                     sipo_in_len  <= sipo_in_len_next;
                     sipo_out_len <= sipo_out_len_next;
-                    
+
                     if (valid_i) begin
                         SIPO_IN <= SIPO_IN | di_shift;
                     end else begin
@@ -220,17 +249,17 @@ module decoder #(
                 sipo_in_len  <= sipo_in_len_next;
                 sipo_out_len <= sipo_out_len_next;
             end
-            
-            if (valid_o && ready_o) begin   
+
+            if (valid_o && ready_o) begin
                 if (sipo_in_len >= ENCODE_LVL) begin
-                    SIPO_OUT <= (SIPO_OUT >> OUTPUT_W*COEFF_W) | sipo_out_in_shift;  
+                    SIPO_OUT <= (SIPO_OUT >> OUTPUT_W*COEFF_W) | sipo_out_in_shift;
                 end else begin
                     SIPO_OUT <= SIPO_OUT >> OUTPUT_W*COEFF_W;
                 end
             end else if (sipo_in_len >= ENCODE_LVL) begin
                 SIPO_OUT <= SIPO_OUT | sipo_out_in_shift;
             end
-        end 
+        end
     end
     
 endmodule

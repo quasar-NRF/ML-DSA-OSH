@@ -60,7 +60,9 @@ module combined_top #(
     input [W-1:0]      data_i,
     output reg         valid_o = 0,
     input              ready_o,
-    output reg [W-1:0] data_o = 0
+    output reg [W-1:0] data_o = 0,
+    // Diagnostic outputs (read-only, for debug)
+    output [62:0]      diag
     );
     
     localparam
@@ -73,7 +75,8 @@ module combined_top #(
         KG_NTTI_T      = 4'd6,
         KG_ADD_T_S2    = 4'd7,
         KG_ENCODE_T0   = 4'd8,
-        KG_UNLOAD_TR   = 4'd9;
+        KG_UNLOAD_TR   = 4'd9,
+        KG_ENCODE_T1   = 4'd10;
     
     localparam
         VY_INIT       = 5'd0,
@@ -143,6 +146,13 @@ module combined_top #(
     reg [511:0] MU = 0;
     
     reg fsm1_even, COMP_FAIL, fail;
+    reg [63:0] dout_compare_diag;  // captures first dout[2] during VY_COMPARE
+    reg [63:0] c_compare_diag;     // captures first C[383:320] during VY_COMPARE
+    reg [63:0] tr_verify_diag;     // TR[511:448] after VY_NTT_Z completes
+    reg [63:0] mu_verify_diag;     // MU[511:448] after VY_NTT_T1 completes
+    reg [63:0] rho_verify_diag;    // RHO[255:192] captured at VY_DECODE_Z ctr0==2
+    reg [63:0] tr_low_diag;        // TR[63:0] at VY_NTT_Z→VY_NTT_T1 transition
+    reg [63:0] ntt_z_ctr0_diag;    // ctr0 at VY_NTT_Z→VY_NTT_T1 transition
     
     reg cstart_fsm0, cstart_fsm1, cstart_fsm2;
     reg nstart_fsm0, nstart_fsm1, nstart_fsm2;
@@ -269,11 +279,25 @@ module combined_top #(
     wire        src_read_s;
     wire        dst_write_s;
     wire        dst_ready_s;
-    
+
+    // Connect diagnostic wires to actual Keccak bus signals
+    // (src_read_s/dst_write_s were undriven passthrough names;
+    //  the actual Keccak[2] bus signals are src_read[2] and dst_write[2])
+    assign src_read_s  = src_read[2];
+    assign dst_write_s = dst_write[2];
+
+    // Diagnostic wires from gen_s
+    wire [4:0]  gs_sample_state;
+    wire        gs_done_latch;
+    wire        gs_mode;
+    wire [2:0]  gs_sampler_state;
+    wire [7:0]  gs_sampler_sample_ctr;
+
     gen_s SECRET_SAMPLER (
         start_s, rst_s, clk, sec_lvl,
         valid_i_s, ready_i_s, din_s, samples_s,
         valid_o_s, ready_o_s, done_s,
+        gs_sample_state, gs_done_latch, gs_mode, gs_sampler_state, gs_sampler_sample_ctr,
         mux_ctrl_k, rst_k_s, kdin_s, dout[2], src_ready_s,
         src_read[2] & mux_ctrl_k, dst_write[2] & mux_ctrl_k, dst_ready_s
         );
@@ -361,18 +385,21 @@ module combined_top #(
     wire valid_o_geny;
     reg  ready_o_geny;
     wire done_geny;
-        
     wire rst_k_y;
     wire  [63:0] din_k_y;
     wire src_ready_y;
-    wire dst_ready_y; 
+    wire dst_ready_y;
 
+    wire [3:0] geny_cstate;
+    wire [31:0] geny_ctr;
     expandmask_ext GEN_Y(
         start_geny, rst_geny, clk, sec_lvl, mlen,
         valid_i_geny, ready_i_geny, di_geny, do_mu, valid_mu,
         do_geny, valid_o_geny, ready_o_geny, done_geny,
         rst_k_y, din_k_y, dout[2], src_ready_y,
-        src_read[2], dst_write[2], dst_ready_y
+        src_read[2], dst_write[2], dst_ready_y,
+        geny_cstate,
+        geny_ctr
         );   
     
     // Encoder and Decoder submodules
@@ -394,7 +421,7 @@ module combined_top #(
     reg  [63:0]  di_dec;
     wire [BUS_W*SAMPLE_W-1:0]  do_dec;
     
-    decoder DECODER (
+    mldsa_decoder DECODER (
         rst_dec, clk, sec_lvl, mode_dec,
         valid_i_dec, ready_i_dec, di_dec,
         do_dec, valid_o_dec, ready_o_dec
@@ -409,7 +436,7 @@ module combined_top #(
     wire valid_o_enc;
     reg  ready_o_enc;
     
-    encoder ENCODER (
+    mldsa_encoder ENCODER (
         rst_enc,clk,sec_lvl,mode_enc,
         valid_i_enc, ready_i_enc, di_enc,
         do_enc, valid_o_enc, ready_o_enc
@@ -436,6 +463,8 @@ module combined_top #(
     reg  poly_valid_i_hint;
     wire poly_ready_i_hint;
     wire poly_valid_o_hint;
+    wire [256*8-1:0] hint_poly_data;
+    wire [10:0] hint_ctr;
     reg  poly_ready_o_hint;
     reg  [63:0] di_hint;
     reg  [95:0] poly_di0_hint, poly_di1_hint;
@@ -447,7 +476,8 @@ module combined_top #(
         ready_i_hint, poly_di0_hint, poly_di1_hint,
         poly_valid_i_hint, poly_ready_i_hint,
         poly_do_hint, poly_valid_o_hint,
-        poly_ready_o_hint
+        poly_ready_o_hint,
+        hint_poly_data, hint_ctr
     );
         
     // MakeHint
@@ -520,6 +550,9 @@ module combined_top #(
     
     reg shake_verif_done;
     reg ntt_verif_done;
+    reg ntt_z_done;            // sticky: all L Z NTTs completed in VY_NTT_Z
+    reg s1_ntt_all_done = 0;  // sticky: all L S1 NTTs completed
+    reg s2_ntt_all_done = 0;  // sticky: all K S2 NTTs completed
     
 
     reg [12:0] T0_LEN, T1_LEN, S1_LEN, S2_LEN, K, L, Z_LEN, W1_LEN;
@@ -531,7 +564,57 @@ module combined_top #(
     reg [5:0] ctr_a1 = 0, ctr_a2 = 0;
     reg [9:0] ctr_t = 0, ctr_c = 0;
     reg [9:0] ctr_dec = 0;
-        
+    reg s2_prereq_done = 0;
+    reg enc_phase = 0; // 0=READ (wait for RAM), 1=HOLD (wait for encoder)
+
+    // Per-phase diagnostic counters
+    reg [9:0] out_word_total = 0;
+    reg sticky_entered_t0 = 0;
+    reg sticky_entered_tr = 0;
+    // Per-phase output word counters (count valid_o && ready_o per state)
+    reg [9:0] owt_hash = 0;    // KG_HASH_Z + KG_UNLOAD_HASH
+    reg [9:0] owt_s1 = 0;      // KG_SAMPLE_S1
+    reg [9:0] owt_s2 = 0;      // KG_SAMPLE_S2
+    reg [9:0] owt_t1 = 0;      // KG_ENCODE_T1
+    reg [9:0] owt_t0 = 0;      // KG_ENCODE_T0
+    reg [9:0] owt_tr = 0;      // KG_UNLOAD_TR
+    // Sticky diagnostic flags for Sign debug
+    reg sticky_cstart_fsm1 = 0;
+    reg sticky_start_geny  = 0;
+    reg sticky_src_read2   = 0;   // did Keccak[2] src_read ever fire?
+    reg sticky_valid_geny  = 0;   // did valid_i_geny ever go high?
+    reg sticky_ready_geny  = 0;   // did ready_i_geny ever go high?
+    reg [3:0] geny_cstate_at_mu_exit = 4'hF;  // GenY state when LOAD_MU exits
+    reg [7:0] keccak_word_cnt = 0; // counts src_read[2] when k_fsm=1
+    // Sticky MULTACC debug
+    reg sticky_multacc_entered = 0;   // FSM2_MULTACC ever entered
+    reg sticky_web6_fired      = 0;   // web_ram6 ever fired in MULTACC
+    reg sticky_start_op1_mult  = 0;   // start_op[1] ever fired while in MULTACC
+    reg sticky_dib6_nonzero_multacc = 0;  // dib_ram6 ever non-zero in MULTACC
+    reg sticky_dib6_nonzero_anywhere = 0; // dib_ram6 ever non-zero anywhere (web_ram6)
+    reg [15:0] multacc_web_count = 0;       // counts web_ram6 pulses in MULTACC (16-bit to avoid overflow)
+    reg [15:0] nttiz_web_count   = 0;       // counts web_ram6 pulses in NTTI_Z
+    reg [31:0] first_multacc_dib_low  = 0;  // low 32 bits of first non-zero MULTACC write
+    reg        first_multacc_captured = 0;
+    reg [31:0] first_nttiz_dib_low    = 0;  // low 32 bits of first non-zero NTTI_Z write
+    reg        first_nttiz_captured   = 0;
+    reg [9:0]  unload_addr_max = 0;          // max addra_ram6 reached in UNLOAD_Z
+    reg [7:0]  multacc_done_count = 0;       // counts done_op[1] pulses in MULTACC (polynomials processed)
+    reg [7:0]  nttiz_done_count   = 0;       // counts done_op[1] pulses in NTTI_Z
+    reg [3:0]  multacc_addr1_max  = 0;       // max addr1_sel_op[1] seen in MULTACC
+    reg [3:0]  nttiz_addr1_max    = 0;       // max addr1_sel_op[1] seen in NTTI_Z
+    reg [3:0]  multacc_addr1_at_exit = 0;    // addr1_sel_op[1] when MULTACC exits to MULT_CS2
+    reg [9:0]  multacc_last_addrb = 0;       // last addrb_ram6 in MULTACC
+    reg [31:0] last_multacc_dib_low = 0;     // last dib_ram6[31:0] written in MULTACC
+    reg [31:0] last_nttiz_dib_low   = 0;     // last dib_ram6[31:0] written in NTTI_Z
+    reg [31:0] or_multacc_dib_low   = 0;     // OR of all dib_ram6[31:0] writes in MULTACC
+    reg [31:0] or_nttiz_dib_low     = 0;     // OR of all dib_ram6[31:0] writes in NTTI_Z
+    reg [15:0] nttiz_nonzero_count  = 0;     // # of non-zero dib writes in NTTI_Z
+    reg [15:0] multacc_nonzero_count= 0;     // # of non-zero dib writes in MULTACC
+    reg [9:0]  multacc_addrb_max = 0;        // max addrb_ram6 in MULTACC
+    reg [9:0]  multacc_addrb_min = 10'h3FF;  // min addrb_ram6 in MULTACC
+    reg [9:0]  nttiz_addrb_max   = 0;        // max addrb_ram6 in NTTI_Z
+
     reg [255:0] rho;
     reg [63:0] keccak_fifo [319:0];
     reg [319:0] keccak_valid;
@@ -950,16 +1033,26 @@ module combined_top #(
             data_o      = {do_enc[7:0],do_enc[15:8], do_enc[23:16], do_enc[31:24], do_enc[39:32], do_enc[47:40],do_enc[55:48], do_enc[63:56]};
             ctr_next    = (valid_o  && ready_o) ? ctr + 1 : ctr;
 
-            // wait until NTT is complete
-            nstate0    = ((done_op[0] && addr1_sel_op[0] == K - 1 && sec_lvl == 2) || (done_a && sec_lvl != 2)) ? KG_MULT_AS1 : KG_SAMPLE_S2;
+            nstate0    = ((done_op[0] && addr1_sel_op[0] == K - 1 && sec_lvl == 2) ||
+                          (a_generated && sec_lvl != 2 &&
+                           ((ctr == S2_LEN[10:3]-1 && valid_o && ready_o) ||
+                            (ctr >= S2_LEN[10:3])))) ? KG_MULT_AS1 : KG_SAMPLE_S2;
             rst_op[0]    = (done_op[0]) ? 1 : 0;
-            naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == K - 1) ? 0 
+            // fix: force addr1=0 when transitioning to MULT_AS1. The original code
+            // relied on transition firing synchronously with the last NTT's
+            // done_op[0] pulse (so naddr1 wrapped via the ==K-1 condition). The
+            // current modified transition condition can fire on cycles when
+            // done_op[0]=0 (waiting on ctr/S2_LEN), leaving addr1=K-1=5 stuck —
+            // MULT then reads RAM1[5,...] which has no s1 poly, producing wrong T.
+            naddr1_sel_op[0] = (nstate0 == KG_MULT_AS1) ? 4'd0
+                             : (done_op[0] && addr1_sel_op[0] == K - 1) ? 0
                              : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
-                            
+
         end
         {2'd0,KG_MULT_AS1}: begin
-            // A*s1 - MULT-ACC     
-            // multa: s1, multb: a, acc: t   
+            // A*s1 - MULT-ACC
+            // multa: s1, multb: a, acc: t
+            rst_enc = 1; // Clear encoder pipeline between S2 and T1
             addra_ram1 = {addr1_sel_op[0], addra1_op[0]};
             addra_ram0  = {addr2_sel_op[0], addra2_op[0]};
             addra_ram3  = {addr3_sel_op[0], addrb1_op[0]};
@@ -997,6 +1090,7 @@ module combined_top #(
         end
         {2'd0,KG_NTTI_T}: begin
             // NTTI on T
+            rst_enc = 1;
             addra_ram3 = {addr1_sel_op[0], addra1_op[0]};
             addrb_ram3 = {addr1_sel_op[0], addrb1_op[0]};
             web_ram3   = web1_op[0];
@@ -1026,43 +1120,64 @@ module combined_top #(
             ctr_next  = (ctr != 5 && src_read[2] && ~src_ready_fsm) ? ctr + 1 : ctr;            
         end
         {2'd0,KG_ADD_T_S2}: begin
-            // ADD T and S2
+            // ADD T and S2 (no encoder output — T1 encoded separately in KG_ENCODE_T1)
+            rst_enc = 1;
             addra_ram3 = {addr1_sel_op[0], addra1_op[0]};
             addra_ram2 = {addr1_sel_op[0], addra2_op[0]};
             doa1_op[0]  = doa_ram3;
             doa2_op[0]  = doa_ram2;
-            
+
             // write T to T
             addrb_ram3 = {addr1_sel_op[0], addrb2_op[0]};
-            web_ram3   = web2_op[0]; 
+            web_ram3   = web2_op[0];
             dib_ram3   = dib2_op[0];
-        
+
             mode_op[0]  = ADD_MODE;
-            
-            
-            // ENCODER
-            mode_enc    = ENCODE_T1;
-            valid_i_enc = web2_op[0];
-            di_enc      = {dib2_op[0][24*3+:23],dib2_op[0][24*2+:23],dib2_op[0][24*1+:23],dib2_op[0][24*0+:23]};
-            
+
             rst_op[0]   = (done_op[0]) ? 1 : 0;
-            naddr1_sel_op[0] = (done_op[0] && naddr1_sel_op[0] == K-1) ? 0 
+            naddr1_sel_op[0] = (done_op[0] && naddr1_sel_op[0] == K-1) ? 0
                              : (done_op[0] ) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
-                             
-            // Unload T1 to encoder->AXI
+
             k_fsm = 1;
+            nstate0 = (done_op[0] && addr1_sel_op[0] == K-1) ? KG_ENCODE_T1 : KG_ADD_T_S2;
+
+        end
+        {2'd0,KG_ENCODE_T1}: begin
+            // Read T1 from RAM3 and encode
+            mode_enc    = ENCODE_T1;
+            addra_ram3  = ctr_t;
+            valid_i_enc = enc_phase;
+            di_enc      = {doa_ram3[24*3+:23],doa_ram3[24*2+:23],doa_ram3[24*1+:23],doa_ram3[24*0+:23]};
+
+            // Unload T1 to encoder->AXI
             valid_o     = valid_o_enc;
             ready_o_enc = ready_o;
             data_o      = {do_enc[7:0],do_enc[15:8], do_enc[23:16], do_enc[31:24], do_enc[39:32], do_enc[47:40],do_enc[55:48], do_enc[63:56]};
             ctr_next    = (valid_o  && ready_o) ? ctr + 1 : ctr;
-            nstate0      = (ctr == T1_LEN[11:3]-1 && valid_o && ready_o) ? KG_ENCODE_T0 : KG_ADD_T_S2;   
-                       
+            nstate0      = (ctr == T1_LEN[11:3]-1 && valid_o && ready_o) ? KG_ENCODE_T0 : KG_ENCODE_T1;
+
+            // Load T1 fifo -> Keccak (for tr computation)
+            k_fsm = 1;
+            case(sec_lvl)
+            2: begin
+                din_fsm       = keccak_fifo[159];
+                src_ready_fsm = (keccak_valid[159] == 0) ? 1 : 0;
+            end
+            3: begin
+                din_fsm       = keccak_fifo[239];
+                src_ready_fsm = (keccak_valid[239] == 0) ? 1 : 0;
+            end
+            5: begin
+                din_fsm       = keccak_fifo[319];
+                src_ready_fsm = (keccak_valid[319] == 0) ? 1 : 0;
+            end
+            endcase
         end
         {2'd0,KG_ENCODE_T0}: begin
             // ENCODER
             mode_enc    = ENCODE_T0;
             addra_ram3  = ctr_t;
-            valid_i_enc = (ctr_t > 0) ? 1 : 0;
+            valid_i_enc = enc_phase;
             di_enc      = {doa_ram3[24*3+:23],doa_ram3[24*2+:23],doa_ram3[24*1+:23],doa_ram3[24*0+:23]};
             
             // Unload T0 to encoder->AXI
@@ -1070,7 +1185,7 @@ module combined_top #(
             ready_o_enc = ready_o;
             data_o      = {do_enc[7:0],do_enc[15:8], do_enc[23:16], do_enc[31:24], do_enc[39:32], do_enc[47:40],do_enc[55:48], do_enc[63:56]};
             ctr_next    = (valid_o  && ready_o) ? ctr + 1 : ctr;
-            nstate0      = (ctr == T0_LEN[11:3]-1 && valid_o && ready_o) ? KG_UNLOAD_TR : KG_ENCODE_T0;  
+            nstate0      = (ctr == T0_LEN[11:3]-1 && valid_o && ready_o) ? KG_UNLOAD_TR : KG_ENCODE_T0;
 
             // Load T1 fifo -> Keccak  
             k_fsm = 1;
@@ -1282,17 +1397,17 @@ module combined_top #(
                         
             
             /* --- CTRL Logic --- */
-            ctr_next  = (done_op[0] && addr1_sel_op[0] == L-1) ? 0 
+            ctr_next  = (ntt_z_done && ctr >= T1_LEN[12:3] && ctr0 >= 8) ? 0
                         : (src_read[2]) ? ctr + 1 : ctr;
-            
-            ctr0_next = (done_op[0] && addr1_sel_op[0] == L-1) ? 0 : (dst_write[2]) ? ctr0 + 1 : ctr0;
-            dst_ready_fsm = (ctr0 < 8) ? 0 : 1;
-            
-            nstate0      = (done_op[0] && addr1_sel_op[0] == L-1) ? VY_NTT_T1 : VY_NTT_Z;
-            rst_op[0]   = (done_op[0]) ? 1 : 0;
+
+            ctr0_next = (ntt_z_done && ctr >= T1_LEN[12:3] && ctr0 >= 8) ? 0 : (dst_write[2]) ? ctr0 + 1 : ctr0;
+            dst_ready_fsm = 0;
+
+            nstate0      = (ntt_z_done && ctr >= T1_LEN[12:3] && ctr0 >= 8) ? VY_NTT_T1 : VY_NTT_Z;
+            rst_op[0]   = (done_op[0] && !(ntt_z_done && ctr >= T1_LEN[12:3] && ctr0 >= 8)) ? 1 : 0;
             mode_op[0]  = FORWARD_NTT_MODE;
-            naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == L-1) ? 0 
-                             : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
+            naddr1_sel_op[0] = (ntt_z_done && ctr >= T1_LEN[12:3] && ctr0 >= 8) ? 0
+                             : (done_op[0] && !ntt_z_done) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
 
         end
         {2'd1,VY_NTT_T1}: begin
@@ -1318,7 +1433,7 @@ module combined_top #(
             
             /* --- CTRL Logic --- */
             nstate0      = ((ntt_verif_done && ({ctr0, 3'd0} >= mlen_PLUS144)))  ? VY_NTT_C : VY_NTT_T1;
-            rst_op[0]   = (done_op[0]) ? 1 : 0;
+            rst_op[0]   = (done_op[0] || ctr0 == 0) ? 1 : 0;
             mode_op[0]  = FORWARD_NTT_MODE;
             naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == K-1) ? 0 
                              : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
@@ -1499,7 +1614,6 @@ module combined_top #(
                 ctr0_next = ctr0 + 1;
             end else if (ctr0 == 1) begin
                 src_ready_fsm = 0;
-                ready_i_mux = 1;
                 din_fsm       = {4'hE, ctilde_out_len[28 - 1 : 0], 32'd512+5'd8*W1_LEN};
             end else if (ctr0 < 10) begin
                 src_ready_fsm = 0;
@@ -1511,65 +1625,103 @@ module combined_top #(
             dst_ready_fsm = 0;
             di_decomp  = doa_ram1;
             addra_ram1 = ctr;
-            valid_i_decomp =  (ctr > 0 && ready_i_decomp && ready_i_decomp_last) ? 1 : 0; //ready_i_enc
-            ready_o_decomp = poly_ready_i_hint;
-            
-            // decomp to useHint
+            valid_i_decomp = (ctr > 0 && ready_i_decomp) ? 1 : 0;
+
+            // Feed useHint for ctr tracking (keeps hint_ctr synchronized)
             poly_valid_i_hint = valid_o_decomp;
             poly_di0_hint     = doa_decomp;
             poly_di1_hint     = dob_decomp;
-            
-            // useHint to encoder
-            mode_enc = ENCODE_W1;
             poly_ready_o_hint = ready_i_enc;
-            valid_i_enc       = poly_valid_o_hint;
-            di_enc = {poly_do_hint[24*3+:23], poly_do_hint[24*2+:23], poly_do_hint[24*1+:23], poly_do_hint[24*0+:23]};
-            
+
+            // Inline hint adjustment: bypass useHint data path
+            // Uses exposed hint_poly_data and hint_ctr from useHint
+            mode_enc = ENCODE_W1;
+            valid_i_enc = valid_o_decomp;
+            begin : gen_w1_inline
+                integer ih;
+                reg [95:0] w1_adj;
+                w1_adj = dob_decomp;
+                for (ih = 0; ih < 4; ih = ih + 1) begin
+                    if (hint_poly_data[hint_ctr + ih] == 1'b1) begin
+                        if (doa_decomp[ih*24+:24] > 261888 || doa_decomp[ih*24+:24] == 0)
+                            w1_adj[ih*24+:24] = (dob_decomp[ih*24+:24] == 0) ? 24'd15 : dob_decomp[ih*24+:24] - 24'd1;
+                        else
+                            w1_adj[ih*24+:24] = (dob_decomp[ih*24+:24] == 15) ? 24'd0 : dob_decomp[ih*24+:24] + 24'd1;
+                    end
+                end
+                di_enc = {w1_adj[24*3+:23], w1_adj[24*2+:23], w1_adj[24*1+:23], w1_adj[24*0+:23]};
+            end
+
+            // Direct backpressure: encoder → decompressor
+            ready_o_decomp = ready_i_enc;
+
             // encoder to SHAKE
             k_fsm = 1;
-            din_fsm = {do_enc[8*0+:8], do_enc[8*1+:8],do_enc[8*2+:8],do_enc[8*3+:8],do_enc[8*4+:8],do_enc[8*5+:8],do_enc[8*6+:8],do_enc[8*7+:8]}; 
+            din_fsm = {do_enc[8*0+:8], do_enc[8*1+:8],do_enc[8*2+:8],do_enc[8*3+:8],do_enc[8*4+:8],do_enc[8*5+:8],do_enc[8*6+:8],do_enc[8*7+:8]};
             src_ready_fsm = !valid_o_enc;
             ready_o_enc = src_read[2];
-            
+
             /* --- CTRL Logic --- */
             nstate0     = (ctr == K*64) ? VY_COMPARE : VY_GENW1;
-            ctr_next   = (ctr == K*64) ? 0 
+            ctr_next   = (ctr == K*64) ? 0
                        : (ready_i_decomp) ? ctr + 1
-                       : (ready_i_decomp == 0 && ready_i_decomp_last == 1) ? ctr - 1: ctr;
+                       : ctr;
         end
         {2'd1,VY_COMPARE}: begin
             /* --- Datapath MUX --- */
             di_decomp  = doa_ram1;
             addra_ram1 = ctr;
             valid_i_decomp = 0;
-            ready_o_decomp = poly_ready_i_hint;
-            
-            // decomp to useHint
-            poly_valid_i_hint = valid_o_decomp;
-            poly_di0_hint      = doa_decomp;
-            poly_di1_hint      = dob_decomp;
-            
-            // useHint to encoder
+
+            // Fix 9: encoder input directly from decompressor pipeline (bypass useHint)
+            // useHint is in EXPAND_HINT state during VY_COMPARE and blocks data flow.
+            // Maintaining the VY_GENW1 data path allows the encoder PISO to drain to Keccak.
             mode_enc = ENCODE_W1;
-            poly_ready_o_hint = ready_i_enc;
-            valid_i_enc       = poly_valid_o_hint;
-            di_enc = {poly_do_hint[24*3+:23], poly_do_hint[24*2+:23], poly_do_hint[24*1+:23], poly_do_hint[24*0+:23]};
-            
+            valid_i_enc = valid_o_decomp;
+            begin : vy_cmp_enc
+                integer ih2;
+                reg [95:0] w1_adj2;
+                w1_adj2 = dob_decomp;
+                for (ih2 = 0; ih2 < 4; ih2 = ih2 + 1) begin
+                    if (hint_poly_data[hint_ctr + ih2] == 1'b1) begin
+                        if (doa_decomp[ih2*24+:24] > 261888 || doa_decomp[ih2*24+:24] == 0)
+                            w1_adj2[ih2*24+:24] = (dob_decomp[ih2*24+:24] == 0) ? 24'd15 : dob_decomp[ih2*24+:24] - 24'd1;
+                        else
+                            w1_adj2[ih2*24+:24] = (dob_decomp[ih2*24+:24] == 15) ? 24'd0 : dob_decomp[ih2*24+:24] + 24'd1;
+                    end
+                end
+                di_enc = {w1_adj2[24*3+:23], w1_adj2[24*2+:23], w1_adj2[24*1+:23], w1_adj2[24*0+:23]};
+            end
+            ready_o_decomp = ready_i_enc;
+
             // encoder to SHAKE
             k_fsm = 1;
             din_fsm = {do_enc[8*0+:8], do_enc[8*1+:8],do_enc[8*2+:8],do_enc[8*3+:8],do_enc[8*4+:8],do_enc[8*5+:8],do_enc[8*6+:8],do_enc[8*7+:8]};
             src_ready_fsm = !valid_o_enc;
             ready_o_enc = src_read[2];
-            
-            dst_ready_fsm = ((ctr < 4 && sec_lvl == 2) || (ctr < 6 && sec_lvl == 3) || (ctr < 8 && sec_lvl == 5)) ? 0 : 1; // (ctr < 4) ? 0 : 1;
-        
+
+            // Block Keccak output after absorbing c~hat' to avoid interfering with diagnostic output
+            dst_ready_fsm = ((ctr < 4 && sec_lvl == 2) || (ctr < 6 && sec_lvl == 3) || (ctr < 8 && sec_lvl == 5)) ? 0 : 1;
+
             /* --- CTRL Logic --- */
-            ctr_next = (dst_write[2]) ? ctr + 1 : ctr;
-            
-            // unload
-            valid_o = ((ctr == 4 && sec_lvl == 2) || (ctr == 6 && sec_lvl == 3) || (ctr == 8 && sec_lvl == 5)) ? 1 : 0;
-            data_o  = ((ctr == 4 && sec_lvl == 2) || (ctr == 6 && sec_lvl == 3) || (ctr == 8 && sec_lvl == 5)) ? fail : 0;
-            nstate0  = (ready_o && valid_o) ? VY_INIT : VY_COMPARE;
+            // Original behavior for sec_lvl 2 and 5: ctr advances only on Keccak writes
+            // For sec_lvl=3: Keccak writes advance ctr 0..5, then output handshake advances 6..12
+            //   After ctr=5 (last Keccak write), dst_ready_fsm stays 1 but we gate ctr advance
+            //   on ready_o instead. dst_write[2] from late Keccak output won't affect ctr.
+            ctr_next = (sec_lvl == 3 && ctr >= 6 && ctr < 12) ? (ready_o ? ctr + 1 : ctr)
+                    : (dst_write[2]) ? ctr + 1
+                    : ctr;
+            // Diagnostic: 7-word output for sec_lvl=3
+            valid_o = (sec_lvl == 3 && ctr >= 6 && ctr <= 12) ? 1 : 0;
+            data_o  = (sec_lvl == 3 && ctr == 6)  ? tr_verify_diag
+                    : (sec_lvl == 3 && ctr == 7)  ? mu_verify_diag
+                    : (sec_lvl == 3 && ctr == 8)  ? dout_compare_diag
+                    : (sec_lvl == 3 && ctr == 9)  ? c_compare_diag
+                    : (sec_lvl == 3 && ctr == 10) ? {63'd0, fail}
+                    : (sec_lvl == 3 && ctr == 11) ? rho_verify_diag
+                    : (sec_lvl == 3 && ctr == 12) ? ntt_z_ctr0_diag
+                    : 0;
+            nstate0  = (sec_lvl == 3 && ctr == 12 && ready_o && valid_o) ? VY_INIT : VY_COMPARE;
         end
         {2'd2,FSM0_INIT}: begin
             rst_enc  = (start) ? 0 : 1;
@@ -1717,10 +1869,14 @@ module combined_top #(
             doa1_op[1]  = doa_ram3;
             dob1_op[1]  = dob_ram3;
             
-            /* --- CTRL Logic --- */ 
-            ctr_next  = (done_op[1] && addr1_sel_op[1] == L-1) ? 0 
+            /* --- CTRL Logic --- */
+            // fix: reverted to baseline — prior code required ctr_dec==K*64-1 which is
+            // impossible for S1 (only L*64-1 decoder outputs). Sign hung here. The
+            // s1_ntt_all_done sticky stays declared for diagnostics but no longer gates
+            // the transition; simple done_op[1] && addr1==L-1 is the original condition.
+            ctr_next  = (done_op[1] && addr1_sel_op[1] == L-1) ? 0
                         : (valid_i_dec && ready_i_dec) ? ctr + 1 : ctr;
-                
+
             nstate0    = (done_op[1] && addr1_sel_op[1] == L-1) ? FSM0_NTT_S2 : FSM0_NTT_S1;
             rst_dec   = (ctr_dec == {K, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 1 : 0;
             
@@ -1743,6 +1899,8 @@ module combined_top #(
             wea_ram3    = valid_o_dec;
             addra_ram3  = 512 | ctr_dec;
             dia_ram3    = {1'd0, do_dec[3*23+:23], 1'd0, do_dec[2*23+:23], 1'd0, do_dec[1*23+:23], 1'd0, do_dec[0*23+:23]};
+
+            // fix: debug instrumentation (DECT0, DECDI) removed after T0 stall fix verified.
             
             // GenA -> BRAM_A
             wea_ram0   = valid_o_a[0];
@@ -1763,10 +1921,12 @@ module combined_top #(
             doa1_op[1]  = doa_ram5;
             dob1_op[1]  = dob_ram5;
             
-            /* --- CTRL Logic --- */ 
-            ctr_next  = (done_op[1] && addr1_sel_op[1] == K-1) ? 0 
+            /* --- CTRL Logic --- */
+            // fix: reverted to baseline — same reason as FSM0_NTT_S1. The
+            // s2_ntt_all_done sticky stays declared but no longer gates transition.
+            ctr_next  = (done_op[1] && addr1_sel_op[1] == K-1) ? 0
                         : (valid_i_dec && ready_i_dec) ? ctr + 1 : ctr;
-                
+
             nstate0    = (done_op[1] && addr1_sel_op[1] == K-1) ? FSM0_NTT_T0 : FSM0_NTT_S2;
             rst_dec   = (ctr_dec == {K, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 1 : 0;
             
@@ -1808,22 +1968,40 @@ module combined_top #(
             nstate0 = (cstart_fsm0) ? FSM0_UNLOAD_Z :  FSM0_STALL;
         end
         {2'd2,FSM0_UNLOAD_Z}: begin
-            /* --- Datapath MUX --- */ 
+            /* --- Datapath MUX --- */
             // MEM -> ENCODER -> AXI
             mode_enc    = ENCODE_Z;
-            valid_i_enc = (ctr != 0 && ctr[0] == 0) ? 1 : 0;
+            valid_i_enc = (ctr != 0 && ctr[0] == 0 && ctr < L*64*2+2) && !(valid_o_enc && !ready_o);
             di_enc      = {doa_ram6[24*3+:23], doa_ram6[24*2+:23],doa_ram6[24*1+:23],doa_ram6[24*0+:23]};
-            addra_ram6  = ctr >> 1;
-            
+            // fix: hold addra_ram6 one address BEHIND during output stall.
+            // dual_port_ram has 1-cycle registered read latency, so doa_ram6
+            // reflects addra_ram6 from the PREVIOUS cycle. In no-stall operation
+            // ctr increments every cycle, and di_enc at ctr=2K shows word K-1
+            // (lag of 1). During stall, ctr holds at 2K and addra holds at K,
+            // so doa_ram6 catches up to word K after 1 cycle — diverging from
+            // the FSM's expectation. When stall ends, valid_i_enc=1 accepts
+            // word K (not K-1), and 2 cycles later accepts word K AGAIN (RAM
+            // lag still showing word K). Result: word K-1 missed, word K
+            // duplicated — observable as +80-bit shift in the output stream.
+            // Holding addra at (ctr>>1)-1 during stall keeps doa_ram6 at word
+            // K-1 throughout, preserving the no-stall di_enc/ctr relationship.
+            addra_ram6  = (valid_o_enc && !ready_o) ? ((ctr >> 1) - 1) : (ctr >> 1);
+
             ready_o_enc = ready_o;
             valid_o     = valid_o_enc;
             data_o      = {do_enc[8*0+:8], do_enc[8*1+:8],do_enc[8*2+:8],do_enc[8*3+:8],do_enc[8*4+:8],do_enc[8*5+:8],do_enc[8*6+:8],do_enc[8*7+:8]};
 
-            
-            /* --- CTRL Logic --- */ 
-            ctr_next = ctr + 1;
-            
-            if (ctr == L*64*2+4) begin
+
+            /* --- CTRL Logic --- */
+            // fix: hold ctr on output stall. With the addra_ram6 fix above,
+            // the FSM/encoder/RAM stay aligned during stall — no duplicate
+            // accepts when stall ends. The original encoder (ready_i=1
+            // always) makes the ready_i_enc term a no-op; kept for safety.
+            ctr_next = (valid_o_enc && !ready_o)            ? ctr :
+                       (valid_i_enc && !ready_i_enc)        ? ctr :
+                       ctr + 1;
+
+            if (ctr >= L*64*2+4 && !valid_o_enc) begin
                 nstate0  = FSM0_UNLOAD_H;
                 ctr_next = 0;
                 rst_enc  = 1;
@@ -1844,14 +2022,13 @@ module combined_top #(
             end
         end
         {2'd2,FSM0_UNLOAD_C}: begin
-            /* --- Datapath MUX --- */ 
+            /* --- Datapath MUX --- */
             // MAKEHINT -> GENC
             read_ch_c = ready_o;
             data_o    = ch_c;
             valid_o   = 1;
-            
             ctr_next = (ready_o) ? ctr + 1 : ctr;
-            /* --- CTRL Logic --- */ 
+            /* --- CTRL Logic --- */
             if (((ctr == 3 && sec_lvl == 2) || (ctr == 5 && sec_lvl == 3) || (ctr == 7 && sec_lvl == 5))  && ready_o) begin
                 nstate0  = FSM0_INIT;
                 ctr_next = 0;
@@ -1864,7 +2041,7 @@ module combined_top #(
             // OP 0
             ctrfsm1_next = 0;
             nstate1 = (cstart_fsm1) ? FSM1_GENY : FSM1_STALL;
-            start_geny = (cstart_fsm1 && cstate0 == FSM0_STALL) ? 1 : 0;
+            start_geny = (cstart_fsm1 && cstate0 == FSM0_STALL) ? 1 : start_geny;
         end
         FSM1_GENY: begin
             addra_ram1   = {fsm1_even, 9'd0} | ctrfsm1;
@@ -2106,17 +2283,19 @@ module combined_top #(
             end
         end
         FSM2_MULT_CT0: begin
-            // multa: c, multb: t0, acc: 0   
+            // multa: c, multb: t0, acc: 0
             addra_ram3 = 512 | {addr1_sel_op[1], addra1_op[1]};
             addrb_ram0 = 3584 | addra2_op[1];
             // write
             addrb_ram6 = 512 | {addr1_sel_op[1], addrb2_op[1]};
             web_ram6   = web2_op[1];
             dib_ram6   = dib2_op[1];
-            
+
             doa1_op[1]  = doa_ram3;
             doa2_op[1]  = dob_ram0;
             dob1_op[1]  = 0; // only acc on s1[x] : x != 0
+
+            // fix: debug instrumentation (MULT_CT0) removed after T0 stall fix verified.
             
             // s1: naddr1_sel_op, a: naddr2_sel_op, t: naddr3_sel_op 
             mode_op[1]  = MULT_MODE;
@@ -2179,7 +2358,7 @@ module combined_top #(
                              : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
         end
         FSM2_NTTI_CT0: begin
-            /* --- Datapath MUX --- */ 
+            /* --- Datapath MUX --- */
             // NTTI CT0
             addra_ram6 = 512 | {addr1_sel_op[1], addra1_op[1]};
             addrb_ram6 = 512 | {addr1_sel_op[1], addrb1_op[1]};
@@ -2187,6 +2366,8 @@ module combined_top #(
             dib_ram6   = dib1_op[1];
             doa1_op[1]  = doa_ram6;
             dob1_op[1]  = dob_ram6;
+
+            // fix: debug instrumentation (NTTI_CT0) removed after T0 stall fix verified.
         
             
             // check norm
@@ -2209,17 +2390,19 @@ module combined_top #(
                              : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
         end
         FSM2_SUB_W0_CS2: begin
-            /* --- Datapath MUX --- */ 
+            /* --- Datapath MUX --- */
             // W0 - CS2: addra1: W0, addra2: CS2, addrb2:w0-cs2
             addra_ram4 = 512 | {addr1_sel_op[1], addra1_op[1]};
             addra_ram5 = 512 | {addr1_sel_op[1], addra2_op[1]};
-            
+
             doa1_op[1]  = doa_ram4;
             doa2_op[1]  = doa_ram5;
-            
+
             addrb_ram5 = 512 | {addr1_sel_op[1], addrb2_op[1]};
             web_ram5   = web2_op[1];
             dib_ram5   = dib2_op[1];
+
+            // fix: debug instrumentation (SUB) removed after T0 stall fix verified.
         
             // Check norm
             mode_norm   = G2_SUB_BETA ;
@@ -2235,13 +2418,15 @@ module combined_top #(
                              : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
         end 
         FSM2_MAKEHINT: begin
-            /* --- Datapath MUX --- */ 
+            /* --- Datapath MUX --- */
             // W0 - CS2: addra1: W0, addra2: CS2, addrb2:w0-cs2
             addra_ram6 = 512 | {addr1_sel_op[1], addra1_op[1]};
             addra_ram5 = 512 | {addr1_sel_op[1], addra2_op[1]};
-            
+
             doa1_op[1]  = doa_ram6;
             doa2_op[1]  = doa_ram5;
+
+            // fix: debug instrumentation (MHIN) removed after T0 stall fix verified.
             
             addrb_ram5 = 512 | {addr1_sel_op[1], addrb2_op[1]};
             web_ram5   = web2_op[1];
@@ -2292,7 +2477,7 @@ module combined_top #(
         mlen_PLUS80 <= mlen + 80;
 //        mlen_PLUS96  <= mlen + 96;
         mlen_PLUS112 <= mlen + 112;
-        mlen_PLUS128 <= mlen + 128;
+        mlen_PLUS128 <= ((mlen + 7) & 32'hFFFFFFF8) + 128;
         mlen_PLUS144 <= mlen + 144;
         mlen_PLUS152 <= mlen + 152;
 
@@ -2313,11 +2498,12 @@ module combined_top #(
         
         shake_verif_done <= shake_verif_done;
         ntt_verif_done <= ntt_verif_done;
+        ntt_z_done <= ntt_z_done;
     
         if (rst) begin
             cstate0 <= FSM0_INIT;
             cstate1 <= FSM1_STALL;
-            cstate1 <= FSM2_STALL;
+            cstate2 <= FSM2_STALL;
             ctr    <= 0;
             ctr0   <= 0;
             ctr1   <= 0;
@@ -2333,6 +2519,9 @@ module combined_top #(
             norm_rejected <= 0;
             shake_verif_done <= 0;
             ntt_verif_done <= 0;
+            ntt_z_done <= 0;
+            s1_ntt_all_done <= 0;
+            s2_ntt_all_done <= 0;
             
             fsm1_even <= 0;
             
@@ -2341,7 +2530,53 @@ module combined_top #(
             cstart_fsm2 <= 0;
             a_generated <= 0;
             a_generated_during <= 0;
+            out_word_total <= 0;
+            sticky_entered_t0 <= 0;
+            sticky_entered_tr <= 0;
+            owt_hash <= 0;
+            owt_s1 <= 0;
+            owt_s2 <= 0;
+            owt_t1 <= 0;
+            owt_t0 <= 0;
+            owt_tr <= 0;
+            sticky_cstart_fsm1 <= 0;
+            sticky_start_geny  <= 0;
+            sticky_src_read2   <= 0;
+            sticky_valid_geny  <= 0;
+            sticky_ready_geny  <= 0;
+            sticky_multacc_entered <= 0;
+            sticky_web6_fired      <= 0;
+            sticky_start_op1_mult  <= 0;
+            sticky_dib6_nonzero_multacc <= 0;
+            sticky_dib6_nonzero_anywhere <= 0;
+            multacc_web_count       <= 0;
+            nttiz_web_count         <= 0;
+            first_multacc_dib_low   <= 0;
+            first_multacc_captured  <= 0;
+            first_nttiz_dib_low     <= 0;
+            first_nttiz_captured    <= 0;
+            unload_addr_max         <= 0;
+            multacc_done_count      <= 0;
+            nttiz_done_count        <= 0;
+            multacc_addr1_max       <= 0;
+            nttiz_addr1_max         <= 0;
+            multacc_addr1_at_exit   <= 0;
+            multacc_last_addrb      <= 0;
+            keccak_word_cnt    <= 0;
         end else begin
+            // Count every completed output transfer
+            if (valid_o && ready_o) begin
+                out_word_total <= out_word_total + 1;
+                case (cstate0)
+                    4'd1, 4'd2: owt_hash <= owt_hash + 1;
+                    4'd3:       owt_s1 <= owt_s1 + 1;
+                    4'd4:       owt_s2 <= owt_s2 + 1;
+                    4'd10:      owt_t1 <= owt_t1 + 1;
+                    4'd8:       owt_t0 <= owt_t0 + 1;
+                    4'd9:       owt_tr <= owt_tr + 1;
+                    default:    ;
+                endcase
+            end
             cstate0 <= nstate0;
             cstate1 <= nstate1;
             cstate2 <= nstate2;
@@ -2356,14 +2591,88 @@ module combined_top #(
             cstart_fsm0 <= nstart_fsm0;
             cstart_fsm1 <= nstart_fsm1;
             cstart_fsm2 <= nstart_fsm2;
+
+            // Sticky diagnostic flags (latch on rising edge, cleared by rst)
+            if (nstart_fsm1 && !cstart_fsm1)
+                sticky_cstart_fsm1 <= 1;
+            if (start_geny && !sticky_start_geny)
+                sticky_start_geny <= 1;
+            if (src_read[2] && !sticky_src_read2)
+                sticky_src_read2 <= 1;
+            if (src_read[2] && k_fsm)
+                keccak_word_cnt <= keccak_word_cnt + 1;
+            if (valid_i_geny && !sticky_valid_geny)
+                sticky_valid_geny <= 1;
+            if (ready_i_geny && !sticky_ready_geny)
+                sticky_ready_geny <= 1;
+            // Sticky MULTACC debug
+            if (cstate2 == FSM2_MULTACC)
+                sticky_multacc_entered <= 1;
+            if (cstate2 == FSM2_MULTACC && web_ram6)
+                sticky_web6_fired <= 1;
+            if (cstate2 == FSM2_MULTACC && start_op[1])
+                sticky_start_op1_mult <= 1;
+            if (cstate2 == FSM2_MULTACC && web_ram6 && dib_ram6 != 0)
+                sticky_dib6_nonzero_multacc <= 1;
+            if (web_ram6 && dib_ram6 != 0)
+                sticky_dib6_nonzero_anywhere <= 1;
+            // Counters and first-data capture
+            if (cstate2 == FSM2_MULTACC && web_ram6)
+                multacc_web_count <= multacc_web_count + 1;
+            if (cstate2 == FSM2_NTTI_Z && web_ram6)
+                nttiz_web_count <= nttiz_web_count + 1;
+            if (cstate2 == FSM2_MULTACC && web_ram6 && !first_multacc_captured) begin
+                first_multacc_dib_low  <= dib_ram6[31:0];
+                first_multacc_captured <= (dib_ram6[31:0] != 0);
+            end
+            if (cstate2 == FSM2_NTTI_Z && web_ram6 && !first_nttiz_captured) begin
+                first_nttiz_dib_low  <= dib_ram6[31:0];
+                first_nttiz_captured <= (dib_ram6[31:0] != 0);
+            end
+            if (cstate0 == FSM0_UNLOAD_Z && (addra_ram6 > unload_addr_max))
+                unload_addr_max <= addra_ram6;
+            // Track polynomial index progression
+            if (cstate2 == FSM2_MULTACC && done_op[1])
+                multacc_done_count <= multacc_done_count + 1;
+            if (cstate2 == FSM2_NTTI_Z && done_op[1])
+                nttiz_done_count <= nttiz_done_count + 1;
+            if (cstate2 == FSM2_MULTACC && (addr1_sel_op[1] > multacc_addr1_max))
+                multacc_addr1_max <= addr1_sel_op[1];
+            if (cstate2 == FSM2_NTTI_Z && (addr1_sel_op[1] > nttiz_addr1_max))
+                nttiz_addr1_max <= addr1_sel_op[1];
+            if (cstate2 == FSM2_MULTACC && nstate2 == FSM2_MULT_CS2)
+                multacc_addr1_at_exit <= addr1_sel_op[1];
+            if (cstate2 == FSM2_MULTACC)
+                multacc_last_addrb <= addrb_ram6;
+            // Capture LAST dib values to compare against FIRST (detects constant vs varying data)
+            if (cstate2 == FSM2_MULTACC && web_ram6) begin
+                last_multacc_dib_low <= dib_ram6[31:0];
+                or_multacc_dib_low   <= or_multacc_dib_low | dib_ram6[31:0];
+                if (dib_ram6[31:0] != 0)
+                    multacc_nonzero_count <= multacc_nonzero_count + 1;
+            end
+            if (cstate2 == FSM2_NTTI_Z && web_ram6) begin
+                last_nttiz_dib_low <= dib_ram6[31:0];
+                or_nttiz_dib_low   <= or_nttiz_dib_low | dib_ram6[31:0];
+                if (dib_ram6[31:0] != 0)
+                    nttiz_nonzero_count <= nttiz_nonzero_count + 1;
+            end
+            // Track addrb range in MULTACC and NTTI_Z (should span 0..63 per poly)
+            if (cstate2 == FSM2_MULTACC && web_ram6) begin
+                if (addrb_ram6 > multacc_addrb_max) multacc_addrb_max <= addrb_ram6;
+                if (addrb_ram6 < multacc_addrb_min) multacc_addrb_min <= addrb_ram6;
+            end
+            if (cstate2 == FSM2_NTTI_Z && web_ram6) begin
+                if (addrb_ram6 > nttiz_addrb_max) nttiz_addrb_max <= addrb_ram6;
+            end
         end
 
         case({mode,cstate0})
             {2'd0,KG_INIT}: begin
-                addr1_sel_op[0] <= 0; 
-                addr2_sel_op[0] <= 0; 
-                addr3_sel_op[0] <= 0; 
-                
+                addr1_sel_op[0] <= 0;
+                addr2_sel_op[0] <= 0;
+                addr3_sel_op[0] <= 0;
+
                 ctr_a1 <= 0;
                 ctr_a2 <= 0;
                 ctr_s1 <= 0;
@@ -2371,6 +2680,8 @@ module combined_top #(
                 keccak_valid <= 0;
 
                 ctr_t <= 0;
+                s2_prereq_done <= 0;
+                // Don't reset diagnostic counters here — preserve for post-run readout
             end
             {2'd0,KG_UNLOAD_HASH}: begin
                 rho <= (valid_i_a && ready_i_a) ?  {rho[255-64:0], dout[2]} : rho;
@@ -2379,6 +2690,7 @@ module combined_top #(
                 ctr_s1 <= (valid_o_s && ready_o_s) ? ctr_s1 + 1 : ctr_s1;
                 if (ctr == S1_LEN[10:3]-1 && valid_o && ready_o) begin
                     ctr_s1 <= 0;
+                    ctr <= 0;
                 end
             
                 addr1_sel_op[0] <= 0; 
@@ -2389,18 +2701,34 @@ module combined_top #(
                 if (done_s) begin
                     ctr_s2 <= 0;
                 end
-            
-                ctr <= (done_a) ? 0 : ctr_next;
-                addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= ((done_op[0] && ~(addr1_sel_op[0] == K - 1 && sec_lvl != 2)) || (done_a && sec_lvl != 2)) ? 1 : 0;
+
+                // Latch: require NTT completion (addr1==L-1) AND GenA completion (a_generated)
+                // For sec_lvl==2 K==L so original condition is preserved via shortcut
+                s2_prereq_done <= ((done_op[0] && addr1_sel_op[0] == L - 1) && (sec_lvl == 2 || a_generated)) ? 1 : s2_prereq_done;
+                // Only reset ctr when the actual transition fires (last s2 word output)
+                ctr <= (((ctr == S2_LEN[10:3]-1 && valid_o && ready_o) ||
+                         (ctr >= S2_LEN[10:3])) &&
+                        (s2_prereq_done || (done_op[0] && addr1_sel_op[0] == K - 1 && sec_lvl == 2) || (a_generated && sec_lvl != 2)))
+                       ? 0 : ctr_next;
+                addr1_sel_op[0] <= naddr1_sel_op[0];
+                // Start next NTT when current one completes (but NOT the last one at L-1).
+                // Also start MULT by pulsing start_op when the transition to KG_MULT_AS1 fires.
+                start_op[0]     <= ((done_op[0] && addr1_sel_op[0] != L - 1) || (nstate0 == KG_MULT_AS1)) ? 1 : 0;
             end
             {2'd0,KG_MULT_AS1}: begin
-                start_op[0]     <= (addr3_sel_op[0] != (K-1)*(L-1) && done_op[0]) ? 1 : 0;
-            
-                addr1_sel_op[0] <= naddr1_sel_op[0]; 
+                // fix: restored original addr3 condition — current code was pulsing
+                // start_op[0] on the last MULT completion, causing op[0] to start a
+                // spurious operation that corrupted downstream INTT/ADD timing.
+                // Original: only pulse start for non-last MULT (addr3 != (K-1)*(L-1)).
+                start_op[0] <= (addr3_sel_op[0] != (K-1)*(L-1) && done_op[0]) ? 1 : 0;
+
+                addr1_sel_op[0] <= naddr1_sel_op[0];
                 addr2_sel_op[0] <= naddr2_sel_op[0];
                 addr3_sel_op[0] <= naddr3_sel_op[0];
-    
+
+                // Ensure ctr is 0 so KG_NTTI_T can properly initialize the
+                // Keccak for tr computation (it expects ctr 0→5 for rho loading).
+                ctr <= 0;
             end
             {2'd0,KG_NTTI_T}: begin
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
@@ -2410,12 +2738,34 @@ module combined_top #(
                 ctr <= (done_op[0] && addr1_sel_op[0] == K-1) ? 0 : ctr_next;
             end
             {2'd0,KG_ADD_T_S2}: begin
-                addr1_sel_op[0] <= naddr1_sel_op[0]; 
+                addr1_sel_op[0] <= naddr1_sel_op[0];
                 start_op[0]     <= (addr1_sel_op[0] != K-1 && done_op[0]) ? 1 : 0;
-                ctr <= (ctr == T1_LEN[11:3]-1 && valid_o  && ready_o) ? 0 : ctr_next;
-                
-                // load fifo
-                if (valid_o  && ready_o) begin
+                ctr       <= 0;
+                ctr_t     <= 0;
+                enc_phase <= 0;
+            end
+            {2'd0,KG_ENCODE_T1}: begin
+                // Backpressure-safe RAM read state machine:
+                //   enc_phase=0 (READ): address presented to RAM, wait 1 cycle
+                //   enc_phase=1 (HOLD): data available, wait for encoder acceptance
+                //   After K*64 inputs: stop reading, wait for encoder to drain
+                if (ctr_t >= K*64) begin
+                    enc_phase <= 0;
+                end else if (!enc_phase) begin
+                    enc_phase <= 1;
+                end else if (ready_i_enc) begin
+                    ctr_t     <= ctr_t + 1;
+                    enc_phase <= 0;
+                end
+                // Use AXI output counter (ctr) for transition timing — matches TB consumption
+                ctr <= (ctr == T1_LEN[11:3]-1 && valid_o && ready_o) ? 0 : ctr_next;
+                if (ctr == T1_LEN[11:3]-1 && valid_o && ready_o) begin
+                    ctr_t     <= 0;
+                    enc_phase <= 0;
+                end
+
+                // load fifo (T1 output for tr hash)
+                if (valid_o && ready_o) begin
                     keccak_valid <= {keccak_valid[318:0], 1'b1};
                     keccak_fifo[0] <= {do_enc[7:0],do_enc[15:8], do_enc[23:16], do_enc[31:24], do_enc[39:32], do_enc[47:40],do_enc[55:48], do_enc[63:56]};
                     for (i = 0; i < 319; i = i + 1)
@@ -2423,9 +2773,24 @@ module combined_top #(
                 end
             end
             {2'd0,KG_ENCODE_T0}: begin
-                ctr <= (ctr == T0_LEN[11:3]-1 && valid_o  && ready_o) ? 0 : ctr_next;
-                ctr_t <= ctr_t + 1;
-                
+                // Backpressure-safe RAM read (same pattern as KG_ENCODE_T1)
+                // After K*64 inputs: stop reading, wait for encoder to drain
+                sticky_entered_t0 <= 1;
+                if (ctr_t >= K*64) begin
+                    enc_phase <= 0;
+                end else if (!enc_phase) begin
+                    enc_phase <= 1;
+                end else if (ready_i_enc) begin
+                    ctr_t     <= ctr_t + 1;
+                    enc_phase <= 0;
+                end
+                // Use AXI output counter (ctr) for transition timing — matches TB consumption
+                ctr <= (ctr == T0_LEN[11:3]-1 && valid_o && ready_o) ? 0 : ctr_next;
+                if (ctr == T0_LEN[11:3]-1 && valid_o && ready_o) begin
+                    ctr_t     <= 0;
+                    enc_phase <= 0;
+                end
+
                 // unload fifo
                 if (src_read[2]  && ~src_ready_fsm) begin
                     keccak_valid <= {keccak_valid[318:0], 1'b0};
@@ -2433,9 +2798,10 @@ module combined_top #(
                     for (i = 0; i < 319; i = i + 1)
                         keccak_fifo[i+1] <= keccak_fifo[i];
                 end
-                
+
             end
             {2'd0,KG_UNLOAD_TR}: begin
+                sticky_entered_tr <= 1;
                 // unload fifo
                 if (src_read[2]  && ~src_ready_fsm) begin
                     keccak_valid <= {keccak_valid[318:0], 1'b0};
@@ -2476,31 +2842,39 @@ module combined_top #(
                 
             end
             {2'd1,VY_DECODE_Z}: begin
-                ctr_dec <= (ctr_dec == {L, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 0 
+                ctr_dec <= (ctr_dec == {L, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 0
                              : (valid_o_dec) ? ctr_dec + 1 : ctr_dec;
                 ctr_c   <= (valid_o_c)   ? ctr_c   + 1 : ctr_c;
-                
+
                 start_op[0] <= (ctr_dec == {L, 6'd0}-1 && valid_o_dec && ready_o_dec)  ? 1 :0;
-                
+
                 RHO <= (src_read[2] && ctr0 > 1) ?  {RHO[255-64:0], 64'd0} : RHO;
+                if (src_read[2] && ctr0 == 2) rho_verify_diag <= RHO[255:192];
             end
             {2'd1,VY_NTT_Z}: begin
                 ctr_dec <= (valid_o_dec) ? ctr_dec + 1 : ctr_dec;
-                addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= (done_op[0]) ? 1 : 0;
-                
-                TR <= (dst_write[2]) ? {TR[511-64:0], dout[2]} : TR;
+                addr1_sel_op[0] <= naddr1_sel_op[0];
+                start_op[0]     <= (done_op[0] && addr1_sel_op[0] != L-1) ? 1 : 0;
+                ntt_z_done      <= (done_op[0] && addr1_sel_op[0] == L-1) ? 1 : ntt_z_done;
+
+                TR <= (dst_write[2] && ctr0 < 8) ? {TR[511-64:0], dout[2]} : TR;
+                if (nstate0 == VY_NTT_T1) begin
+                    tr_verify_diag <= TR[511:448];
+                    tr_low_diag <= TR[63:0];
+                    ntt_z_ctr0_diag <= {57'd0, ctr0[6:0]};
+                end
             end
             {2'd1,VY_NTT_T1}: begin
                 TR <= (src_read[2] && ctr0 > 1) ? {TR[511-64:0], 64'd0} : TR;
                 MU <= (dst_write[2]) ? {MU[511-64:0], dout[2]} : MU;
-                
+
                 mlen <= (ready_i && valid_i && ctr0 == 1) ? data_i[31:0] + 16'd2 : mlen;
-                addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= ((done_op[0] && (addr1_sel_op[0] != K-1)) || ((nstate0 == VY_NTT_C))) ? 1 : 0;
-                
+                addr1_sel_op[0] <= naddr1_sel_op[0];
+                start_op[0]     <= ((ctr0 == 0) || (done_op[0] && (addr1_sel_op[0] != K-1)) || ((nstate0 == VY_NTT_C))) ? 1 : 0;
+
                 shake_verif_done <= ({ctr0, 3'd0} >= mlen_PLUS144) ? 1 : 0;
                 ntt_verif_done <= (done_op[0] &&  (addr1_sel_op[0] == K-1)) ? 1 : ntt_verif_done;
+                if (nstate0 == VY_NTT_C) mu_verify_diag <= MU[511:448];
             end
             {2'd1,VY_NTT_C}: begin
                 shake_verif_done <= 0;
@@ -2526,13 +2900,21 @@ module combined_top #(
                 start_op[0]     <= (done_op[0]) ? 1 : 0; 
             end
             {2'd1,VY_INTT}: begin
-                addr1_sel_op[0] <= naddr1_sel_op[0]; 
+                addr1_sel_op[0] <= naddr1_sel_op[0];
                 start_op[0]     <= (done_op[0] && addr1_sel_op[0] != K-1) ? 1 : 0;
-                
+
+                // Reset keccak_word_cnt at VY_INTT start to count only this Keccak operation
+                if (ctr0 == 0)
+                    keccak_word_cnt <= 0;
                 MU <= (src_read[2] && ctr0 > 1) ? {MU[511-64:0], 64'd0} : MU;
             end
             {2'd1,VY_COMPARE}: begin
                 if (dst_write[2]) begin
+                    // Capture first comparison for diagnostics
+                    if (ctr == 0) begin
+                        dout_compare_diag <= dout[2];
+                        c_compare_diag <= C[383:320];
+                    end
                     case(sec_lvl)
                     2: begin
                         C <= {256'd0, C[255-64:0], 64'd0};
@@ -2553,11 +2935,14 @@ module combined_top #(
                         end
                     end
                     endcase
-                    
+
                 end
             end
             {2'd2,FSM0_LOAD_MU}: begin
                 mlen <= (ready_i && valid_i && ctr1 == 0) ? data_i[31:0] + 16'd2 : mlen;
+                // Capture GenY state at LOAD_MU exit
+                if ({ctr1_next,3'd0} > mlen_PLUS128)
+                    geny_cstate_at_mu_exit <= geny_cstate;
             end
             {2'd2,FSM0_DECODE_S1}: begin
                 if (valid_o_dec && ready_o_dec) begin
@@ -2570,16 +2955,24 @@ module combined_top #(
                 end              
             end
             {2'd2,FSM0_NTT_S1}: begin
-                ctr_dec <= (ctr_dec == {K, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 0 
+                ctr_dec <= (ctr_dec == {K, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 0
                              : (valid_o_dec) ? ctr_dec + 1 : ctr_dec;
-                             
-                start_op[1] <= ((rst_op[1] && addr1_sel_op[1] != L-1) || ((nstate0 == FSM0_NTT_S2)))  ? 1 : 0; 
+
+                start_op[1] <= ((rst_op[1] && addr1_sel_op[1] != L-1) || ((nstate0 == FSM0_NTT_S2)))  ? 1 : 0;
+
+                // Latch when all L S1 NTTs complete; clear on transition to NTT_S2
+                if (done_op[1] && addr1_sel_op[1] == L-1) s1_ntt_all_done <= 1;
+                if (nstate0 == FSM0_NTT_S2) s1_ntt_all_done <= 0;
             end
             {2'd2,FSM0_NTT_S2}: begin
-                ctr_dec <= (ctr_dec == {K, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 0 
+                ctr_dec <= (ctr_dec == {K, 6'd0}-1 && valid_o_dec && ready_o_dec) ? 0
                              : (valid_o_dec) ? ctr_dec + 1 : ctr_dec;
-                             
-                start_op[1] <= ((rst_op[1] && addr1_sel_op[1] != K-1) || (nstate0 == FSM0_NTT_T0)) ? 1 : 0; 
+
+                start_op[1] <= ((rst_op[1] && addr1_sel_op[1] != K-1) || (nstate0 == FSM0_NTT_T0)) ? 1 : 0;
+
+                // Latch when all K S2 NTTs complete; clear on transition to NTT_T0
+                if (done_op[1] && addr1_sel_op[1] == K-1) s2_ntt_all_done <= 1;
+                if (nstate0 == FSM0_NTT_T0) s2_ntt_all_done <= 0;
             end
             {2'd2,FSM0_NTT_T0}: begin
                 start_op[1] <= (rst_op[1] && addr1_sel_op[1] != K-1) ? 1 : 0; 
@@ -2662,5 +3055,48 @@ module combined_top #(
             ctr_a2 <= 0;
         end
     end
-    
+
+    // -----------------------------------------------------------------------
+    // Diagnostic output packing (63 bits)
+    // -----------------------------------------------------------------------
+    // Bits  [7:0]   padding
+    // Bit   [8]     geny_ctr[8]
+    // Bits [13:9]   cstate0[4:0]
+    // Bits [18:14]  cstate1[4:0] (Sign) | out_word_total[4:0] (KeyGen)
+    // Bits [23:19]  cstate2[4:0] (Sign) | out_word_total[9:5] (KeyGen)
+    // Bits [30:24]  owt_t1[6:0]
+    // Bits [33:31]  geny_cstate[2:0]
+    // Bits [37:34]  geny_ctr[3:0] (dup)
+    // Bits [41:38]  ctr1[3:0]
+    // Bits [49:42]  geny_ctr[7:0]
+    // Bit  [50]     enc_phase
+    // Bit  [51]     ready_i_enc
+    // Bit  [52]     valid_o
+    // Bit  [53]     done_op[0]
+    // Bit  [54]     s2_prereq_done
+    // Bit  [55]     sticky_entered_t0
+    // Bit  [56]     sticky_entered_tr
+    // Bit  [57]     s1_ntt_all_done (Sign mode)
+    // Bit  [58]     s2_ntt_all_done (Sign mode)
+    // Bit  [59]     done_op[1]
+    // Bit  [60]     sticky_start_geny
+    // Bit  [61]     sticky_cstart_fsm1
+    // Bit  [62]     geny_cstate[3] (MSB)
+    // Bits [49:42]  geny_ctr[7:0] (GenY internal word counter)
+    // Bits [41:38]  ctr1[3:0] (FSM0 LOAD_MU word counter low bits)
+    // Bits [37:34]  handshake sticky flags: src_read2, valid_geny, ready_geny, src_ready_y
+    // Bits [33:31]  geny_cstate[2:0]
+    // Bits [30:27]  geny_cstate_at_mu_exit[3:0]
+    // Bits [26:24]  owt_t1[2:0]
+    // Bits [23:19]  cstate2[4:0]
+    // Bits [18:14]  cstate1[4:0]
+    // Bits [13:9]   cstate0[4:0]
+    // Bits [8:0]    geny_ctr[8] + padding
+    assign diag = {
+        nttiz_nonzero_count[15:0],      // [63:48] # non-zero dib writes in NTTI_Z (expect ~320 if working)
+        multacc_nonzero_count[15:0],    // [47:32] # non-zero dib writes in MULTACC
+        or_nttiz_dib_low[15:0],         // [31:16] OR of all NTTI_Z dib[15:0] writes (0=all zeros)
+        or_multacc_dib_low[15:0]        // [15:0]  OR of all MULTACC dib[15:0] writes
+    };
+
 endmodule

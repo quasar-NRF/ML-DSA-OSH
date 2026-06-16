@@ -65,6 +65,9 @@ module sampler_s #(
     output reg valid_o,
     input  ready_o,
     output reg done,
+    // Diagnostic outputs
+    output [2:0]        diag_state,
+    output [7:0]        diag_sample_ctr,
     // Keccak passthrough
     input             keccak_ctrl,
     output reg        rst_k,
@@ -225,6 +228,9 @@ module sampler_s #(
         end
         endcase
     end
-   
-   
+
+    // Diagnostic output assignments
+    assign diag_state      = state;
+    assign diag_sample_ctr = sample_ctr;
+
 endmodule

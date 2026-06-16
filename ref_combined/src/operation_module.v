@@ -227,11 +227,11 @@ module operation_module(
         done_delay <= done_latch;
         
         if (rst) begin
-            running    <= 0;
+            running    <= 0;  // fix: reverted from `<= start` — that change caused MULT to start one cycle early and corrupt T computation. Original behavior is correct.
             done_latch <= 0;
             pause      <= 0;
             pause_ctr <= 0;
-            
+
             valid_sr <= 0;
             for (i = 0; i < 23; i = i + 1)
                 addr1_sr[i] <= 0;

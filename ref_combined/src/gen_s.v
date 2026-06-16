@@ -63,6 +63,12 @@ module gen_s# (
     output [SAMPLER_NUM-1:0] valid_o,
     input  [SAMPLER_NUM-1:0] ready_o,
     output reg done_sampler,
+    // Diagnostic outputs
+    output [4:0]        diag_sample_state,
+    output [SAMPLER_NUM-1:0] diag_done_latch,
+    output              diag_mode,
+    output [2:0]        diag_sampler_state,
+    output [7:0]        diag_sampler_sample_ctr,
     // Keccak passthrough
     input             keccak_ctrl,
     output            rst_k,
@@ -81,18 +87,23 @@ module gen_s# (
     reg  [4:0] sample_state;
     reg start_s; 
     reg mode;
+    // Diagnostic wires from sampler_s instances
+    wire [2:0] sampler_diag_state [SAMPLER_NUM-1:0];
+    wire [7:0] sampler_diag_sample_ctr [SAMPLER_NUM-1:0];
+
     genvar g;
     generate
         // unpack array
         for (g = 0; g < SAMPLER_NUM; g = g + 1) begin
             assign sampler_output[g] = samples[g*(SAMPLER_W*SAMPLE_W)+:(SAMPLER_W*SAMPLE_W)];
         end
-    
+
         // gen sampler
         for (g = 0; g < SAMPLER_NUM; g = g + 1) begin
-            sampler_s SAMPLER_S (start_s, rst, clk, re_sample[g], sec_lvl, N[g], valid_seed, ready_i[g], seed_i, 
+            sampler_s SAMPLER_S (start_s, rst, clk, re_sample[g], sec_lvl, N[g], valid_seed, ready_i[g], seed_i,
                                     samples[g*(SAMPLER_W*SAMPLE_W)+:(SAMPLER_W*SAMPLE_W)], valid_o[g], ready_o[g], done[g],
-                                    keccak_ctrl, rst_k, din, dout, src_ready, src_read, dst_write, dst_ready);                
+                                    sampler_diag_state[g], sampler_diag_sample_ctr[g],
+                                    keccak_ctrl, rst_k, din, dout, src_ready, src_read, dst_write, dst_ready);
         end
     endgenerate
     
@@ -175,5 +186,13 @@ module gen_s# (
             end
         end
     
-    end    
+    end
+
+    // Diagnostic output assignments
+    assign diag_sample_state = sample_state;
+    assign diag_done_latch   = done_latch;
+    assign diag_mode         = mode;
+    assign diag_sampler_state      = sampler_diag_state[0];
+    assign diag_sampler_sample_ctr = sampler_diag_sample_ctr[0];
+
 endmodule
