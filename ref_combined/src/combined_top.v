@@ -1704,24 +1704,16 @@ module combined_top #(
             dst_ready_fsm = ((ctr < 4 && sec_lvl == 2) || (ctr < 6 && sec_lvl == 3) || (ctr < 8 && sec_lvl == 5)) ? 0 : 1;
 
             /* --- CTRL Logic --- */
-            // Original behavior for sec_lvl 2 and 5: ctr advances only on Keccak writes
-            // For sec_lvl=3: Keccak writes advance ctr 0..5, then output handshake advances 6..12
-            //   After ctr=5 (last Keccak write), dst_ready_fsm stays 1 but we gate ctr advance
-            //   on ready_o instead. dst_write[2] from late Keccak output won't affect ctr.
-            ctr_next = (sec_lvl == 3 && ctr >= 6 && ctr < 12) ? (ready_o ? ctr + 1 : ctr)
-                    : (dst_write[2]) ? ctr + 1
-                    : ctr;
-            // Diagnostic: 7-word output for sec_lvl=3
-            valid_o = (sec_lvl == 3 && ctr >= 6 && ctr <= 12) ? 1 : 0;
-            data_o  = (sec_lvl == 3 && ctr == 6)  ? tr_verify_diag
-                    : (sec_lvl == 3 && ctr == 7)  ? mu_verify_diag
-                    : (sec_lvl == 3 && ctr == 8)  ? dout_compare_diag
-                    : (sec_lvl == 3 && ctr == 9)  ? c_compare_diag
-                    : (sec_lvl == 3 && ctr == 10) ? {63'd0, fail}
-                    : (sec_lvl == 3 && ctr == 11) ? rho_verify_diag
-                    : (sec_lvl == 3 && ctr == 12) ? ntt_z_ctr0_diag
-                    : 0;
-            nstate0  = (sec_lvl == 3 && ctr == 12 && ready_o && valid_o) ? VY_INIT : VY_COMPARE;
+            // fix: reverted to baseline single-word fail output. The previous code
+            // emitted 7 diagnostic words (TR, MU, hash, c, fail, rho, ntt_z_ctr0)
+            // for sec_lvl=3, but the testbench (and any spec-compliant verify
+            // consumer) reads ONE word: the fail bit (0=valid, 1=invalid). The
+            // first word at ctr=6 was TR (0xe247931e1c7bdfd0 in KAT#0), not fail,
+            // so the testbench saw "valid" when KAT expects "invalid".
+            ctr_next = (dst_write[2]) ? ctr + 1 : ctr;
+            valid_o = ((ctr == 4 && sec_lvl == 2) || (ctr == 6 && sec_lvl == 3) || (ctr == 8 && sec_lvl == 5)) ? 1 : 0;
+            data_o  = ((ctr == 4 && sec_lvl == 2) || (ctr == 6 && sec_lvl == 3) || (ctr == 8 && sec_lvl == 5)) ? {63'd0, fail} : 0;
+            nstate0  = (ready_o && valid_o) ? VY_INIT : VY_COMPARE;
         end
         {2'd2,FSM0_INIT}: begin
             rst_enc  = (start) ? 0 : 1;
