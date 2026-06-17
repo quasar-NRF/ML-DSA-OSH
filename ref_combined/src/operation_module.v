@@ -1,3 +1,11 @@
+// ==================================================
+// Giulio Golinelli - golinelli.giulio13@gmail.com
+// TUMCREATE QUASAR RESEARCH ENGINEER
+// Modified: 2026-06-17
+// This file contains modifications vs. the upstream
+// CVA6 / ML-DSA-OSH source fork.
+// ==================================================
+
 /*
  * From our research paper "High-Performance Hardware Implementation of CRYSTALS-Dilithium"
  * by Luke Beckwith, Duc Tri Nguyen, Kris Gaj
