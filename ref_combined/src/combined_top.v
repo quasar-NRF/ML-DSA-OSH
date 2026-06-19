@@ -1502,7 +1502,7 @@ module combined_top #(
             /* --- CTRL Logic --- */
             mode_op[0]  = FORWARD_NTT_MODE;
             
-            nstate0      = ((done_op[0] && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? VY_MULT_AZ : VY_NTT_C; //
+            nstate0      = ((done_op[0] && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? VY_MULT_AZ : VY_NTT_C;
             rst_op[0]   = ((done_op[0] && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? 1 : 0;
             
         end
@@ -1643,18 +1643,28 @@ module combined_top #(
 
             // Inline hint adjustment: bypass useHint data path
             // Uses exposed hint_poly_data and hint_ctr from useHint
+            // TUMCREATE FIX (2026-06-19): thresholds branched on sec_lvl. Upstream
+            // hardcoded (q-1)/32=261888 and w1_max=15 (sec_lvl=3/5 only). For
+            // sec_lvl=2 the correct values are (q-1)/88=95232 and w1_max=43, per
+            // FIPS 204 (ML-DSA-44 has gamma2=(q-1)/88) and confirmed in usehint.v.
+            // Without this branch, sec_lvl=2 Verify produces incorrect w1, hence
+            // incorrect c~' hash, hence false fail=1 for valid signatures.
             mode_enc = ENCODE_W1;
             valid_i_enc = valid_o_decomp;
             begin : gen_w1_inline
                 integer ih;
                 reg [95:0] w1_adj;
+                reg [23:0] gamma2_thr;
+                reg [23:0] w1_max;
+                gamma2_thr = (sec_lvl == 2) ? 24'd95232 : 24'd261888;
+                w1_max     = (sec_lvl == 2) ? 24'd43    : 24'd15;
                 w1_adj = dob_decomp;
                 for (ih = 0; ih < 4; ih = ih + 1) begin
                     if (hint_poly_data[hint_ctr + ih] == 1'b1) begin
-                        if (doa_decomp[ih*24+:24] > 261888 || doa_decomp[ih*24+:24] == 0)
-                            w1_adj[ih*24+:24] = (dob_decomp[ih*24+:24] == 0) ? 24'd15 : dob_decomp[ih*24+:24] - 24'd1;
+                        if (doa_decomp[ih*24+:24] > gamma2_thr || doa_decomp[ih*24+:24] == 0)
+                            w1_adj[ih*24+:24] = (dob_decomp[ih*24+:24] == 0) ? w1_max : dob_decomp[ih*24+:24] - 24'd1;
                         else
-                            w1_adj[ih*24+:24] = (dob_decomp[ih*24+:24] == 15) ? 24'd0 : dob_decomp[ih*24+:24] + 24'd1;
+                            w1_adj[ih*24+:24] = (dob_decomp[ih*24+:24] == w1_max) ? 24'd0 : dob_decomp[ih*24+:24] + 24'd1;
                     end
                 end
                 di_enc = {w1_adj[24*3+:23], w1_adj[24*2+:23], w1_adj[24*1+:23], w1_adj[24*0+:23]};
@@ -1684,18 +1694,25 @@ module combined_top #(
             // Fix 9: encoder input directly from decompressor pipeline (bypass useHint)
             // useHint is in EXPAND_HINT state during VY_COMPARE and blocks data flow.
             // Maintaining the VY_GENW1 data path allows the encoder PISO to drain to Keccak.
+            // TUMCREATE FIX (2026-06-19): same sec_lvl branch as VY_GENW1 above —
+            // upstream hardcoded (q-1)/32=261888 and 15 which only works for
+            // sec_lvl=3/5. sec_lvl=2 needs (q-1)/88=95232 and 43.
             mode_enc = ENCODE_W1;
             valid_i_enc = valid_o_decomp;
             begin : vy_cmp_enc
                 integer ih2;
                 reg [95:0] w1_adj2;
+                reg [23:0] gamma2_thr2;
+                reg [23:0] w1_max2;
+                gamma2_thr2 = (sec_lvl == 2) ? 24'd95232 : 24'd261888;
+                w1_max2     = (sec_lvl == 2) ? 24'd43    : 24'd15;
                 w1_adj2 = dob_decomp;
                 for (ih2 = 0; ih2 < 4; ih2 = ih2 + 1) begin
                     if (hint_poly_data[hint_ctr + ih2] == 1'b1) begin
-                        if (doa_decomp[ih2*24+:24] > 261888 || doa_decomp[ih2*24+:24] == 0)
-                            w1_adj2[ih2*24+:24] = (dob_decomp[ih2*24+:24] == 0) ? 24'd15 : dob_decomp[ih2*24+:24] - 24'd1;
+                        if (doa_decomp[ih2*24+:24] > gamma2_thr2 || doa_decomp[ih2*24+:24] == 0)
+                            w1_adj2[ih2*24+:24] = (dob_decomp[ih2*24+:24] == 0) ? w1_max2 : dob_decomp[ih2*24+:24] - 24'd1;
                         else
-                            w1_adj2[ih2*24+:24] = (dob_decomp[ih2*24+:24] == 15) ? 24'd0 : dob_decomp[ih2*24+:24] + 24'd1;
+                            w1_adj2[ih2*24+:24] = (dob_decomp[ih2*24+:24] == w1_max2) ? 24'd0 : dob_decomp[ih2*24+:24] + 24'd1;
                     end
                 end
                 di_enc = {w1_adj2[24*3+:23], w1_adj2[24*2+:23], w1_adj2[24*1+:23], w1_adj2[24*0+:23]};
@@ -2075,7 +2092,7 @@ module combined_top #(
             
             
         
-            /* --- CTRL Logic --- */ 
+            /* --- CTRL Logic --- */
             if (a_generated || cstate0 == 7) begin ////(sec_lvl == 2 || cstate0 == 7)   (a_generated || cstate0 == 7)
                 nstate1    = (done_op[0] && addr1_sel_op[0] == L-1) ? FSM1_MULT_A_Y : FSM1_NTT_Y;
                 rst_op[0]   = (done_op[0]) ? 1 : 0;
@@ -2470,6 +2487,14 @@ module combined_top #(
     reg a_generated;
     reg a_generated_during;
     reg op_done_ntty;
+    // TUMCREATE fix (2026-06-18): verify-mode sticky latch for done_a.
+    // done_a from gen_a_ext is a 1-cycle pulse. For sec_lvl=5 verify, VY_NTT_C
+    // is entered long after the sampler finishes (sampler done @ ~64ms, VY_NTT_C
+    // entered @ ~144ms in observed sim). Without a sticky latch, the pulse is
+    // missed and VY_NTT_C hangs waiting for done_a that already fired.
+    // vy_a_generated captures done_a in verify mode (mode==2'd1), cleared on rst
+    // or when leaving verify mode.
+    reg vy_a_generated;
     
     always @(posedge clk) begin
         mlen_PLUS48  <= mlen + 48;
@@ -2499,6 +2524,10 @@ module combined_top #(
         shake_verif_done <= shake_verif_done;
         ntt_verif_done <= ntt_verif_done;
         ntt_z_done <= ntt_z_done;
+        // TUMCREATE fix: verify-mode sticky latch for done_a pulse.
+        // Captures the 1-cycle done_a pulse so VY_NTT_C can see it
+        // even when entered long after the sampler finished.
+        if (mode == 2'd1 && done_a) vy_a_generated <= 1;
     
         if (rst) begin
             cstate0 <= FSM0_INIT;
@@ -2530,6 +2559,7 @@ module combined_top #(
             cstart_fsm2 <= 0;
             a_generated <= 0;
             a_generated_during <= 0;
+            vy_a_generated <= 0; // TUMCREATE fix: clear verify-mode sticky done_a latch
             out_word_total <= 0;
             sticky_entered_t0 <= 0;
             sticky_entered_tr <= 0;
